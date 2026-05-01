@@ -57,16 +57,16 @@ fi
 # Нагрузочный тест через oha
 echo "--- POST /jobs (create + process) ---"
 oha \
-    --duration "${DURATION}s" \
-    --connections "$CONNECTIONS" \
-    --method POST \
-    --body '{"payload":"benchmark-payload-hello-world"}' \
-    --content-type "application/json" \
+    -z "${DURATION}s" \
+    -c "$CONNECTIONS" \
+    -d '{"payload":"benchmark-payload-hello-world"}' \
+    -m POST \
+    -T "application/json" \
     "$BASE_URL/jobs"
 
 echo ""
 echo "--- GET /health (baseline latency) ---"
 oha \
-    --duration 5s \
-    --connections 100 \
+    -z 5s \
+    -c 100 \
     "$BASE_URL/health"
