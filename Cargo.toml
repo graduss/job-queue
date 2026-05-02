@@ -2,6 +2,8 @@
 name = "job-queue"
 version = "0.1.0"
 edition = "2024"
+description = "Step-by-step study project: from a naive sync server to a production-ready async job queue in Rust"
+repository = "https://github.com/graduss/job-queue"
 
 [[bin]]
 name = "server"
