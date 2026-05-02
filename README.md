@@ -3,12 +3,20 @@
 Поэтапный проект: от простейшего синхронного сервера до production-ready очереди задач.
 На каждом этапе — замер производительности, чтобы видеть реальный эффект каждого изменения.
 
+## Сборка и зависимости
+```bash
+sudo apt install wrk          # установить wrk если нет
+cargo install oha             # установить oha если нет
+cargo build --release
+```
+
 ## Быстрый старт
 
 ```bash
 cargo run --bin server        # запустить сервер
-./load_test.sh                # нагрузочный тест (нужен oha)
-cargo install oha             # установить oha если нет
+./load_test.sh                # нагрузочный тест oha
+./load_test_wrk.sh            # нагрузочный тест wrk
+./load_test_wrk.sh > ./results/stage-0.txt # run and save
 ```
 
 ### Попробовать руками
@@ -43,6 +51,17 @@ curl http://localhost:3000/health
 Store:   std::sync::Mutex<HashMap<Uuid, Job>>
 Workers: нет, обработка в хэндлере
 ```
+
+**Результаты** (4 threads, 50 conn, 10s, `--release`):
+
+| Сценарий | RPS | Latency p50 | Latency p99 |
+|----------|-----|-------------|-------------|
+| POST /jobs (write + process) | 4 274 | 11.40 ms | 11.92 ms |
+| GET /health (no work) | 431 438 | 0.181 ms | 0.453 ms |
+| Mixed 80% reads / 20% writes | 21 162 | 2.45 ms | 11.71 ms |
+| GET /jobs (list all, накопленные данные) | 27 | 1.41 s | 1.97 s |
+
+Узкое место: `simulate_work` держит мьютекс и блокирует tokio-поток на 10 мс — все запросы выстраиваются в очередь.
 
 ---
 
