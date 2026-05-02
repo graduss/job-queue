@@ -1,9 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
-
+use tokio::sync::RwLock;
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -11,7 +11,6 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -50,7 +49,7 @@ pub struct CreateJobResponse {
 
 // AppState
 
-pub type Store = Arc<Mutex<HashMap<Uuid, Job>>>;
+pub type Store = Arc<RwLock<HashMap<Uuid, Job>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -75,14 +74,14 @@ async fn create_job(
     };
 
     {
-        let mut store = state.store.lock().unwrap();
+        let mut store = state.store.write().await;
         store.insert(id, job);
     }
 
     simulate_work(&req.payload).await;
 
     {
-        let mut store = state.store.lock().unwrap();
+        let mut store = state.store.write().await;
         if let Some(job) = store.get_mut(&id) {
             job.status = JobStatus::Done;
             job.result = Some(format!("processed: {}", job.payload.to_uppercase()));
@@ -100,7 +99,7 @@ async fn create_job(
 }
 
 async fn get_job(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = state.store.read().await;
 
     match store.get(&id) {
         Some(job) => (StatusCode::OK, Json(Some(job.clone()))),
@@ -109,7 +108,7 @@ async fn get_job(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl In
 }
 
 async fn list_jobs(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
+    let store = state.store.read().await;
 
     (
         StatusCode::OK,
@@ -142,7 +141,7 @@ async fn main() {
     println!();
 
     let state = AppState {
-        store: Arc::new(Mutex::new(HashMap::new())),
+        store: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let app = Router::new()
