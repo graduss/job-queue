@@ -98,7 +98,7 @@ async fn get_job(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl In
 }
 
 async fn list_jobs(State(state): State<AppState>) -> impl IntoResponse {
-    let jobs: Vec<Job> = state.store.iter()
+    let jobs: Vec<Job> = state.store.iter().take(5000)
         .map(|entry| entry.value().clone())
         .collect();
     (
