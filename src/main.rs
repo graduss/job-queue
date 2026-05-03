@@ -1,9 +1,8 @@
 use std::{
-    collections::HashMap,
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::RwLock;
+use dashmap::DashMap;
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -49,7 +48,7 @@ pub struct CreateJobResponse {
 
 // AppState
 
-pub type Store = Arc<RwLock<HashMap<Uuid, Job>>>;
+pub type Store = Arc<DashMap<Uuid, Job>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -64,29 +63,21 @@ async fn create_job(
 ) -> impl IntoResponse {
     let id = Uuid::new_v4();
 
-    let job = Job {
+    state.store.insert(id, Job {
         id,
         payload: req.payload.clone(),
         status: JobStatus::Pending,
         result: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
-    };
-
-    {
-        let mut store = state.store.write().await;
-        store.insert(id, job);
-    }
+    });
 
     simulate_work(&req.payload).await;
 
-    {
-        let mut store = state.store.write().await;
-        if let Some(job) = store.get_mut(&id) {
-            job.status = JobStatus::Done;
-            job.result = Some(format!("processed: {}", job.payload.to_uppercase()));
-            job.updated_at = Utc::now();
-        }
+    if let Some(mut job) = state.store.get_mut(&id) {
+        job.status = JobStatus::Done;
+        job.result = Some(format!("processed: {}", job.payload.to_uppercase()));
+        job.updated_at = Utc::now();
     }
 
     (
@@ -99,20 +90,20 @@ async fn create_job(
 }
 
 async fn get_job(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl IntoResponse {
-    let store = state.store.read().await;
 
-    match store.get(&id) {
+    match state.store.get(&id) {
         Some(job) => (StatusCode::OK, Json(Some(job.clone()))),
         None => (StatusCode::NOT_FOUND, Json(None)),
     }
 }
 
 async fn list_jobs(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.read().await;
-
+    let jobs: Vec<Job> = state.store.iter()
+        .map(|entry| entry.value().clone())
+        .collect();
     (
         StatusCode::OK,
-        Json(store.values().cloned().collect::<Vec<Job>>()),
+        Json(jobs),
     )
 }
 
@@ -135,13 +126,13 @@ async fn simulate_work(payload: &String) {
 
 #[tokio::main]
 async fn main() {
-    println!("Stage 0 — Baseline server");
-    println!("Store: std::sync::Mutex<HashMap>");
+    println!("Stage 2 — DashMap (шардированный lock-free HashMap)");
+    println!("Store:   DashMap<Uuid, Job>");
     println!("Workers: none (synchronous in handler)");
     println!();
 
     let state = AppState {
-        store: Arc::new(RwLock::new(HashMap::new())),
+        store: Arc::new(DashMap::new())
     };
 
     let app = Router::new()
