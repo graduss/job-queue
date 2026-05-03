@@ -65,25 +65,47 @@ Workers: нет, обработка в хэндлере
 
 ---
 
-### Stage 1 — tokio::sync::RwLock
+### ✅ Stage 1 — tokio::sync::RwLock
 
 **Что:** заменяем `std::Mutex` на `tokio::sync::RwLock`.  
 **Зачем:** `std::Mutex` блокирует поток tokio-runtime целиком. `RwLock` позволяет
 многим читателям работать одновременно и не блокирует async executor.  
 **Ожидание:** улучшение latency на read-heavy нагрузке.
 
+**Результаты** (4 threads, 50 conn, 10s, `--release`):
+
+| Сценарий | RPS | Latency p50 | Latency p99 |
+|----------|-----|-------------|-------------|
+| POST /jobs (write + process) | 4 250 | 11.46 ms | 11.88 ms |
+| GET /health (no work) | 428 625 | 0.180 ms | 0.448 ms |
+| Mixed 80% reads / 20% writes | 21 194 | 2.45 ms | 11.72 ms |
+| GET /jobs (list all) | 76 | 599 ms | 1.17 s |
+
+Ключевой эффект: `GET /jobs` (list) ускорился в ~2.8× по RPS (27→76) и p99 упал с 1.97s до 1.17s — параллельные читатели больше не блокируют друг друга. POST без изменений: `simulate_work` всё ещё держит весь хэндлер 10 мс.
+
 ---
 
-### Stage 2 — DashMap (lock-free шарды)
+### ✅ Stage 2 — DashMap (lock-free шарды)
 
 **Что:** заменяем `RwLock<HashMap>` на `DashMap`.  
 **Зачем:** один глобальный lock — contention при записи. DashMap делит данные
 на N шардов, каждый со своим мьютексом. Несколько потоков пишут параллельно.  
 **Ожидание:** p99 latency улучшается, RPS растёт при write-heavy нагрузке.
 
+**Результаты** (4 threads, 50 conn, 10s, `--release`):
+
+| Сценарий | RPS | Latency p50 | Latency p99 |
+|----------|-----|-------------|-------------|
+| POST /jobs (write + process) | 4 280 | 11.41 ms | 11.93 ms |
+| GET /health (no work) | 432 487 | 0.176 ms | 0.437 ms |
+| Mixed 80% reads / 20% writes | 21 119 | 2.45 ms | 11.80 ms |
+| GET /jobs (list all) | 33 | 1.28 s | 1.96 s |
+
+Примечание: RPS для list упал относительно Stage 1 (33 vs 76) — DashMap собирает элементы по шардам, что при большом объёме данных медленнее обхода одного RwLock. Узкое место по-прежнему в `simulate_work` в хэндлере, а не в структуре данных.
+
 ---
 
-### Stage 3 — mpsc канал + пул воркеров
+### ✅ Stage 3 — mpsc канал + пул воркеров
 
 **Что:** хэндлер кладёт задачу в bounded channel и сразу отвечает `202 Accepted`.
 Отдельные tokio-задачи (воркеры) читают из канала и обрабатывают.  
@@ -92,9 +114,20 @@ Workers: нет, обработка в хэндлере
 
 ```
 Store:   DashMap
-Channel: tokio::sync::mpsc (bounded)
-Workers: N tokio::spawn задач
+Channel: tokio::sync::mpsc (bounded, capacity=100)
+Workers: 4 tokio::spawn задачи
 ```
+
+**Результаты** (4 threads, 50 conn, 10s, `--release`):
+
+| Сценарий | RPS | Latency p50 | Latency p99 | Примечание |
+|----------|-----|-------------|-------------|------------|
+| POST /jobs (202 Accepted) | 322 000 | 0.118 ms | 0.377 ms | ~99.9% — 503 (queue full) |
+| GET /health (no work) | 378 724 | 0.102 ms | 0.301 ms | |
+| Mixed 80% reads / 20% writes | 327 208 | 0.116 ms | 0.324 ms | ~20% — 503 |
+| GET /jobs (list all) | 1 435 | 33.09 ms | 60.51 ms | |
+
+Ключевой эффект: latency хэндлера POST упала с 11 мс до ~118 мкс (93×). 503-ответы — ожидаемое backpressure: 50 соединений флудят быстрее, чем 4 воркера успевают опустошить bounded(100) канал. List-jobs ускорился с ~33 RPS до 1 435 RPS — нет конкуренции с `simulate_work` за поток.
 
 ---
 
