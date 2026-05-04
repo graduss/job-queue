@@ -1,8 +1,3 @@
-use std::{
-    sync::Arc,
-    time::Duration,
-};
-use dashmap::DashMap;
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -11,7 +6,9 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
 // Models
@@ -63,14 +60,17 @@ async fn create_job(
 ) -> impl IntoResponse {
     let id = Uuid::new_v4();
 
-    state.store.insert(id, Job {
+    state.store.insert(
         id,
-        payload: req.payload.clone(),
-        status: JobStatus::Pending,
-        result: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    });
+        Job {
+            id,
+            payload: req.payload.clone(),
+            status: JobStatus::Pending,
+            result: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+    );
 
     simulate_work(&req.payload).await;
 
@@ -90,7 +90,6 @@ async fn create_job(
 }
 
 async fn get_job(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl IntoResponse {
-
     match state.store.get(&id) {
         Some(job) => (StatusCode::OK, Json(Some(job.clone()))),
         None => (StatusCode::NOT_FOUND, Json(None)),
@@ -98,13 +97,13 @@ async fn get_job(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl In
 }
 
 async fn list_jobs(State(state): State<AppState>) -> impl IntoResponse {
-    let jobs: Vec<Job> = state.store.iter().take(5000)
+    let jobs: Vec<Job> = state
+        .store
+        .iter()
+        .take(500)
         .map(|entry| entry.value().clone())
         .collect();
-    (
-        StatusCode::OK,
-        Json(jobs),
-    )
+    (StatusCode::OK, Json(jobs))
 }
 
 async fn health() -> impl IntoResponse {
@@ -132,7 +131,7 @@ async fn main() {
     println!();
 
     let state = AppState {
-        store: Arc::new(DashMap::new())
+        store: Arc::new(DashMap::new()),
     };
 
     let app = Router::new()

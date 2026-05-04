@@ -67,6 +67,13 @@ oha \
 echo ""
 echo "--- GET /health (baseline latency) ---"
 oha \
-    -z 5s \
-    -c 100 \
+    -z 20s \
+    -c 500 \
     "$BASE_URL/health"
+
+echo ""
+echo "--- GET /jobs (read all) ---"
+oha \
+    -z "${DURATION}s" \
+    -c "$CONNECTIONS" \
+    "$BASE_URL/jobs"
