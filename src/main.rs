@@ -12,8 +12,8 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
-const WORKER_COUNT: usize = 4;
-const CHANNEL_CAPACITY: usize = 100;
+const WORKER_COUNT: usize = 1e3 as usize;
+const CHANNEL_CAPACITY: usize = 1e6 as usize;
 
 // Models
 
@@ -78,7 +78,7 @@ async fn create_job(
         },
     );
 
-    match state.tx.try_send(id) {
+    match state.tx.send(id).await {
         Ok(_) => (
             StatusCode::ACCEPTED,
             Json(CreateJobResponse {

@@ -67,8 +67,8 @@ oha \
 echo ""
 echo "--- GET /health (baseline latency) ---"
 oha \
-    -z 20s \
-    -c 500 \
+    -z 5s \
+    -c 100 \
     "$BASE_URL/health"
 
 echo ""
