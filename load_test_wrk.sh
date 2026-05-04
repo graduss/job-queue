@@ -16,8 +16,8 @@ LUA_DIR="$SCRIPT_DIR/wrk_scripts"
 
 # ─── Параметры по умолчанию ──────────────────────────────────
 DURATION=10
-THREADS=4
-CONNECTIONS=50
+THREADS=8
+CONNECTIONS=100
 STAGE="all"
 
 # ─── Разбор аргументов ───────────────────────────────────────
@@ -59,20 +59,39 @@ wrk.method  = "POST"
 wrk.headers["Content-Type"] = "application/json"
 wrk.body    = '{"payload":"benchmark-payload-hello-world"}'
 
-local counter = 0
-local errors  = 0
+local threads = {}
+
+function setup(thread)
+    thread:set("counter", 0)
+    thread:set("errors", 0)
+    table.insert(threads, thread)
+end
 
 function response(status, headers, body)
+    local counter = wrk.thread:get("counter")
+    local errors  = wrk.thread:get("errors")
+
     if status ~= 201 and status ~= 202 then
         errors = errors + 1
     end
     counter = counter + 1
+
+    wrk.thread:set("counter", counter)
+    wrk.thread:set("errors", errors)
 end
 
 function done(summary, latency, requests)
+    local total_counter = 0
+    local total_errors = 0
+    
+    for _, thread in ipairs(threads) do
+        total_counter = total_counter + thread:get("counter")
+        total_errors = total_errors + thread:get("errors")
+    end
+
     io.write(string.format(
         "\n  Errors (non-2xx): %d / %d  (%.1f%%)\n",
-        errors, counter, errors / math.max(counter, 1) * 100
+        total_errors, total_counter, total_errors / math.max(total_counter, 1) * 100
     ))
 end
 LUA
@@ -163,7 +182,8 @@ case "$STAGE" in
             "Основной сценарий: создать и выполнить задачу" \
             "post_job.lua" \
             "$BASE_URL/jobs"
-
+        ;;&
+    1|all)
         run_test \
             "2. GET /health  (baseline latency)" \
             "Нулевая нагрузка: сколько стоит просто ответить" \
