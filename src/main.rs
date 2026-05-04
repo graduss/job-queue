@@ -79,11 +79,12 @@ async fn create_job(
         updated_at: Utc::now(),
     });
 
-    match state.tx.try_send(id) {
+    match state.tx.send(id).await {
         Ok(_) => (
             StatusCode::ACCEPTED,
             Json(CreateJobResponse {id, status: JobStatus::Pending }),
         ).into_response(),
+
         Err(e) => {
             state.store.remove(&id);
             (
