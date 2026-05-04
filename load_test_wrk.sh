@@ -16,8 +16,8 @@ LUA_DIR="$SCRIPT_DIR/wrk_scripts"
 
 # ─── Параметры по умолчанию ──────────────────────────────────
 DURATION=10
-THREADS=4
-CONNECTIONS=50
+THREADS=8
+CONNECTIONS=100
 STAGE="all"
 
 # ─── Разбор аргументов ───────────────────────────────────────
@@ -182,7 +182,8 @@ case "$STAGE" in
             "Основной сценарий: создать и выполнить задачу" \
             "post_job.lua" \
             "$BASE_URL/jobs"
-
+        ;;&
+    1|all)
         run_test \
             "2. GET /health  (baseline latency)" \
             "Нулевая нагрузка: сколько стоит просто ответить" \
