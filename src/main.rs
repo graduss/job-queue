@@ -8,35 +8,39 @@ use axum::{
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
-const WORKER_COUNT: usize = 20;
+const WORKER_COUNT: usize = 4;
 const CHANNEL_CAPACITY: usize = 100;
 
 const CPU_WORK_ITERATIONS: usize = 5_000_000;
 
 // Models
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, sqlx::Type, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "job_kind", rename_all = "snake_case")]
 pub enum JobKind {
     #[default]
     Io,
     Cpu,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
+#[sqlx(rename_all = "snake_case", type_name = "job_status")]
 pub enum JobStatus {
+    #[default]
     Pending,
     Running,
     Done,
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Job {
     pub id: Uuid,
     pub payload: String,
@@ -62,13 +66,11 @@ pub struct CreateJobResponse {
 }
 
 // AppState
-
-pub type Store = Arc<DashMap<Uuid, Job>>;
 pub type SharedRx = Arc<Mutex<mpsc::Receiver<Uuid>>>;
 
 #[derive(Clone)]
 pub struct AppState {
-    store: Store,
+    db: PgPool,
     tx: mpsc::Sender<Uuid>,
 }
 
@@ -77,45 +79,34 @@ pub struct AppState {
 async fn create_job(
     State(state): State<AppState>,
     Json(req): Json<CreateJobRequest>,
-) -> impl IntoResponse {
-    let id = Uuid::new_v4();
+) -> Result<impl IntoResponse, impl IntoResponse> {
+    let job = sqlx::query_as::<_, Job>(
+        "INSERT INTO jobs (payload, kind)
+         VALUES ($1, $2)
+         RETURNING *",
+    )
+    .bind(&req.payload)
+    .bind(&req.kind)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| {
+        eprintln!("{:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })?;
 
-    state.store.insert(
-        id,
-        Job {
-            id,
-            payload: req.payload.clone(),
-            kind: req.kind.clone(),
-            status: JobStatus::Pending,
-            result: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        },
-    );
+    state.tx.send(job.id).await.map_err(|e| {
+        eprintln!("{:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })?;
 
-    match state.tx.send(id).await {
-        Ok(_) => (
-            StatusCode::ACCEPTED,
-            Json(CreateJobResponse {
-                id,
-                status: JobStatus::Pending,
-                kind: req.kind,
-            }),
-        )
-            .into_response(),
-
-        Err(e) => {
-            state.store.remove(&id);
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": format!("queue full: {e}"),
-                    "capacity": CHANNEL_CAPACITY,
-                })),
-            )
-                .into_response()
-        }
-    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CreateJobResponse {
+            id: job.id,
+            status: job.status,
+            kind: job.kind,
+        }),
+    ))
 }
 
 async fn get_job(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl IntoResponse {
