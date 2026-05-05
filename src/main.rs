@@ -12,8 +12,8 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
-const WORKER_COUNT: usize = 100;
-const CHANNEL_CAPACITY: usize = 1_000_000;
+const WORKER_COUNT: usize = 20;
+const CHANNEL_CAPACITY: usize = 100;
 
 const CPU_WORK_ITERATIONS: usize = 5_000_000;
 
@@ -85,7 +85,7 @@ async fn create_job(
         Job {
             id,
             payload: req.payload.clone(),
-            kind: req.kind,
+            kind: req.kind.clone(),
             status: JobStatus::Pending,
             result: None,
             created_at: Utc::now(),
@@ -99,6 +99,7 @@ async fn create_job(
             Json(CreateJobResponse {
                 id,
                 status: JobStatus::Pending,
+                kind: req.kind,
             }),
         )
             .into_response(),
@@ -119,8 +120,8 @@ async fn create_job(
 
 async fn get_job(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl IntoResponse {
     match state.store.get(&id) {
-        Some(job) => (StatusCode::OK, Json(Some(job.clone()))),
-        None => (StatusCode::NOT_FOUND, Json(None)),
+        Some(job) => (StatusCode::OK, Json(Some(job.clone()))).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -143,6 +144,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             "stage": 0,
             "workers": WORKER_COUNT,
             "queue_capacity": CHANNEL_CAPACITY,
+            "CPU_WORK_ITERATIONS": CPU_WORK_ITERATIONS,
             "queue_used": queued,
         })),
     )
@@ -162,21 +164,26 @@ async fn worker(id: usize, rx: SharedRx, store: Store) {
             }
         };
 
-        if let Some(mut job) = store.get_mut(&job_id) {
-            job.status = JobStatus::Pending;
-            job.updated_at = Utc::now();
-        }
+        let (kind, pyload) = {
+            if let Some(mut job) = store.get_mut(&job_id) {
+                job.status = JobStatus::Pending;
+                job.updated_at = Utc::now();
+                (job.kind.clone(), job.payload.clone())
+            } else {
+                continue;
+            }
+        };
 
-        let payload = store.get(&job_id).map(|job| job.payload.clone());
-
-        let result = match payload {
-            Some(payload) => Some(process_job(&payload).await),
-            None => None,
+        let result = match kind {
+            JobKind::Io => pocess_io_job(&pyload).await,
+            JobKind::Cpu => tokio::task::spawn_blocking(move || process_cpu_job(&pyload))
+                .await
+                .unwrap_or_else(|e| format!("Worker panicked: {e}")),
         };
 
         if let Some(mut job) = store.get_mut(&job_id) {
             job.status = JobStatus::Done;
-            job.result = result;
+            job.result = Some(result);
             job.updated_at = Utc::now();
         }
     }
@@ -184,14 +191,20 @@ async fn worker(id: usize, rx: SharedRx, store: Store) {
 
 // Simulator
 
-async fn process_job(payload: &String) -> String {
+async fn pocess_io_job(payload: &str) -> String {
     tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let _hash: u64 = payload
-        .bytes()
-        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-
     format!("processed: {}", payload.to_uppercase())
+}
+
+fn process_cpu_job(payload: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for _ in 0..CPU_WORK_ITERATIONS {
+        for &byte in payload.as_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("hash: {hash:x}:{}", payload.to_uppercase())
 }
 
 #[tokio::main]

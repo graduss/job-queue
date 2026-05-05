@@ -59,21 +59,21 @@ echo "--- POST /jobs (create + process) ---"
 oha \
     -z "${DURATION}s" \
     -c "$CONNECTIONS" \
-    -d '{"payload":"benchmark-payload-hello-world"}' \
+    -d '{"payload":"benchmark-payload-hello-world", "kind": "cpu"}' \
     -m POST \
     -T "application/json" \
     "$BASE_URL/jobs"
 
-echo ""
-echo "--- GET /health (baseline latency) ---"
-oha \
-    -z 5s \
-    -c 100 \
-    "$BASE_URL/health"
+# echo ""
+# echo "--- GET /health (baseline latency) ---"
+# oha \
+#     -z 5s \
+#     -c 100 \
+#     "$BASE_URL/health"
 
-echo ""
-echo "--- GET /jobs (read all) ---"
-oha \
-    -z "${DURATION}s" \
-    -c "$CONNECTIONS" \
-    "$BASE_URL/jobs"
+# echo ""
+# echo "--- GET /jobs (read all) ---"
+# oha \
+#     -z "${DURATION}s" \
+#     -c "$CONNECTIONS" \
+#     "$BASE_URL/jobs"
