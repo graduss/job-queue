@@ -70,3 +70,10 @@ oha \
     -z 5s \
     -c 100 \
     "$BASE_URL/health"
+
+echo ""
+echo "--- GET /jobs (read all) ---"
+oha \
+    -z "${DURATION}s" \
+    -c "$CONNECTIONS" \
+    "$BASE_URL/jobs"

@@ -1,8 +1,3 @@
-use std::{
-    sync::Arc,
-    time::Duration
-};
-
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -10,10 +5,11 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use dashmap::DashMap;
-use tokio::sync::{ mpsc, Mutex };
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::{sync::Arc, time::Duration};
+use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
 const WORKER_COUNT: usize = 100;
@@ -84,21 +80,28 @@ async fn create_job(
 ) -> impl IntoResponse {
     let id = Uuid::new_v4();
 
-    state.store.insert(id, Job {
+    state.store.insert(
         id,
-        payload: req.payload.clone(),
-        kind: req.kind,
-        status: JobStatus::Pending,
-        result: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    });
+        Job {
+            id,
+            payload: req.payload.clone(),
+            kind: req.kind,
+            status: JobStatus::Pending,
+            result: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+    );
 
     match state.tx.send(id).await {
         Ok(_) => (
             StatusCode::ACCEPTED,
-            Json(CreateJobResponse {id, status: JobStatus::Pending }),
-        ).into_response(),
+            Json(CreateJobResponse {
+                id,
+                status: JobStatus::Pending,
+            }),
+        )
+            .into_response(),
 
         Err(e) => {
             state.store.remove(&id);
@@ -108,7 +111,8 @@ async fn create_job(
                     "error": format!("queue full: {e}"),
                     "capacity": CHANNEL_CAPACITY,
                 })),
-            ).into_response()
+            )
+                .into_response()
         }
     }
 }
@@ -121,13 +125,13 @@ async fn get_job(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl In
 }
 
 async fn list_jobs(State(state): State<AppState>) -> impl IntoResponse {
-    let jobs: Vec<Job> = state.store.iter().take(5000)
+    let jobs: Vec<Job> = state
+        .store
+        .iter()
+        .take(500)
         .map(|entry| entry.value().clone())
         .collect();
-    (
-        StatusCode::OK,
-        Json(jobs),
-    )
+    (StatusCode::OK, Json(jobs))
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -163,8 +167,7 @@ async fn worker(id: usize, rx: SharedRx, store: Store) {
             job.updated_at = Utc::now();
         }
 
-        let payload = store.get(&job_id)
-            .map(|job| job.payload.clone());
+        let payload = store.get(&job_id).map(|job| job.payload.clone());
 
         let result = match payload {
             Some(payload) => Some(process_job(&payload).await),
@@ -217,10 +220,7 @@ async fn main() {
         tx
     };
 
-    let state = AppState {
-        store,
-        tx,
-    };
+    let state = AppState { store, tx };
 
     let app = Router::new()
         .route("/health", get(health))
