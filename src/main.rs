@@ -16,10 +16,20 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const WORKER_COUNT: usize = 4;
-const CHANNEL_CAPACITY: usize = 100;
+const WORKER_COUNT: usize = 100;
+const CHANNEL_CAPACITY: usize = 1_000_000;
+
+const CPU_WORK_ITERATIONS: usize = 5_000_000;
 
 // Models
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    #[default]
+    Io,
+    Cpu,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +44,7 @@ pub enum JobStatus {
 pub struct Job {
     pub id: Uuid,
     pub payload: String,
+    pub kind: JobKind,
     pub status: JobStatus,
     pub result: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -43,12 +54,15 @@ pub struct Job {
 #[derive(Debug, Deserialize)]
 pub struct CreateJobRequest {
     pub payload: String,
+    #[serde(default)]
+    pub kind: JobKind,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CreateJobResponse {
     pub id: Uuid,
     pub status: JobStatus,
+    pub kind: JobKind,
 }
 
 // AppState
@@ -73,6 +87,7 @@ async fn create_job(
     state.store.insert(id, Job {
         id,
         payload: req.payload.clone(),
+        kind: req.kind,
         status: JobStatus::Pending,
         result: None,
         created_at: Utc::now(),

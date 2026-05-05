@@ -23,8 +23,8 @@ STAGE="all"
 # ─── Разбор аргументов ───────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --heavy)    DURATION=60; CONNECTIONS=2000; THREADS=12; shift ;;
-        --quick)    DURATION=5;  CONNECTIONS=20;  THREADS=2; shift ;;
+        --heavy)    DURATION=30; CONNECTIONS=200; shift ;;
+        --quick)    DURATION=5;  CONNECTIONS=20;  shift ;;
         --stage)    STAGE="$2"; shift 2 ;;
         --url)      BASE_URL="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
@@ -189,7 +189,7 @@ case "$STAGE" in
             "Нулевая нагрузка: сколько стоит просто ответить" \
             "" \
             "$BASE_URL/health" \
-            #100
+            100
 
         run_test \
             "3. Mixed  (80% reads / 20% writes)" \
@@ -206,7 +206,7 @@ case "$STAGE" in
             "Чтение всего хранилища под нагрузкой" \
             "" \
             "$BASE_URL/jobs" \
-            #50
+            50
         ;;
 esac
 
