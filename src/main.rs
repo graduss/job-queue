@@ -2,21 +2,21 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
+use dotenvy::dotenv;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
-const WORKER_COUNT: usize = 4;
-const CHANNEL_CAPACITY: usize = 100;
+const WORKER_COUNT: usize = 10;
+const CHANNEL_CAPACITY: usize = 1_000;
 
-const CPU_WORK_ITERATIONS: usize = 5_000_000;
+const CPU_WORK_ITERATIONS: usize = 5_000;
 
 // Models
 
@@ -68,6 +68,22 @@ pub struct CreateJobResponse {
 // AppState
 pub type SharedRx = Arc<Mutex<mpsc::Receiver<Uuid>>>;
 
+pub enum AppError {
+    JobNotFound,
+    InternalServerError,
+    ServiceUnavailable,
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        match self {
+            AppError::JobNotFound => StatusCode::NOT_FOUND.into_response(),
+            AppError::InternalServerError => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            AppError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     db: PgPool,
@@ -79,7 +95,12 @@ pub struct AppState {
 async fn create_job(
     State(state): State<AppState>,
     Json(req): Json<CreateJobRequest>,
-) -> Result<impl IntoResponse, impl IntoResponse> {
+) -> Result<impl IntoResponse, AppError> {
+    let mut tx = state.db.begin().await.map_err(|e| {
+        eprintln!("{:?}", e);
+        AppError::InternalServerError
+    })?;
+
     let job = sqlx::query_as::<_, Job>(
         "INSERT INTO jobs (payload, kind)
          VALUES ($1, $2)
@@ -87,43 +108,59 @@ async fn create_job(
     )
     .bind(&req.payload)
     .bind(&req.kind)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
         eprintln!("{:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        AppError::InternalServerError
     })?;
 
-    state.tx.send(job.id).await.map_err(|e| {
-        eprintln!("{:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    })?;
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(CreateJobResponse {
-            id: job.id,
-            status: job.status,
-            kind: job.kind,
-        }),
-    ))
-}
-
-async fn get_job(State(state): State<AppState>, Path(id): Path<Uuid>) -> impl IntoResponse {
-    match state.store.get(&id) {
-        Some(job) => (StatusCode::OK, Json(Some(job.clone()))).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+    match state.tx.try_send(job.id) {
+        Ok(_) => {
+            tx.commit().await.map_err(|e| {
+                eprintln!("{:?}", e);
+                AppError::InternalServerError
+            })?;
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(CreateJobResponse {
+                    id: job.id,
+                    status: job.status,
+                    kind: job.kind,
+                }),
+            ))
+        }
+        Err(_) => {
+            tx.rollback().await.map_err(|e| {
+                eprintln!("{:?}", e);
+                AppError::InternalServerError
+            })?;
+            return Err(AppError::ServiceUnavailable);
+        }
     }
 }
 
-async fn list_jobs(State(state): State<AppState>) -> impl IntoResponse {
-    let jobs: Vec<Job> = state
-        .store
-        .iter()
-        .take(500)
-        .map(|entry| entry.value().clone())
-        .collect();
-    (StatusCode::OK, Json(jobs))
+async fn get_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
+        .bind(&id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| AppError::InternalServerError)?
+        .ok_or(AppError::JobNotFound)?;
+
+    Ok((StatusCode::OK, Json(job)))
+}
+
+async fn list_jobs(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+    let jobs = sqlx::query_as::<_, Job>("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 5000")
+        .fetch_all(&state.db)
+        .await
+        .map_err(|_| AppError::InternalServerError)?;
+
+    Ok((StatusCode::OK, Json(jobs)))
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -143,39 +180,74 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 
 // Wrker
 
-async fn worker(id: usize, rx: SharedRx, store: Store) {
+async fn worker(id: usize, rx: SharedRx, store: PgPool) {
     println!("Worker {id} started");
 
     loop {
-        let job_id = match rx.lock().await.recv().await {
-            Some(id) => id,
-            None => {
-                println!("Worker {id}: channel closed, exiting");
-                break;
+        let job_id = {
+            let mut rx_guard = rx.lock().await;
+            match rx_guard.recv().await {
+                Some(id) => id,
+                None => {
+                    println!("Worker {id}: channel closed, exiting");
+                    break;
+                }
             }
         };
 
-        let (kind, pyload) = {
-            if let Some(mut job) = store.get_mut(&job_id) {
-                job.status = JobStatus::Pending;
-                job.updated_at = Utc::now();
-                (job.kind.clone(), job.payload.clone())
-            } else {
+        let row = sqlx::query_as::<_, Job>(
+            "UPDATE jobs SET status = 'running', updated_at = NOW()
+             WHERE id = $1 AND status = 'pending'
+             RETURNING *",
+        )
+        .bind(&job_id)
+        .fetch_optional(&store)
+        .await;
+
+        let job = match row {
+            Ok(Some(job)) => job,
+            Ok(None) => {
+                println!("Worker {id}: job not found or already processed");
+                continue;
+            }
+            Err(e) => {
+                println!("Worker {id}: database error: {e}");
                 continue;
             }
         };
 
-        let result = match kind {
-            JobKind::Io => pocess_io_job(&pyload).await,
-            JobKind::Cpu => tokio::task::spawn_blocking(move || process_cpu_job(&pyload))
+        let result = match job.kind {
+            JobKind::Io => Ok(pocess_io_job(&job.payload).await),
+            JobKind::Cpu => tokio::task::spawn_blocking(move || process_cpu_job(&job.payload))
                 .await
-                .unwrap_or_else(|e| format!("Worker panicked: {e}")),
+                .map_err(|e| e.to_string()),
         };
 
-        if let Some(mut job) = store.get_mut(&job_id) {
-            job.status = JobStatus::Done;
-            job.result = Some(result);
-            job.updated_at = Utc::now();
+        let update_result = match result {
+            Ok(response) => {
+                sqlx::query(
+                    "UPDATE jobs SET status = 'done', result = $1, updated_at = NOW()
+                     WHERE id = $2",
+                )
+                .bind(response)
+                .bind(job_id)
+                .execute(&store)
+                .await
+            }
+            Err(e) => {
+                sqlx::query(
+                    "UPDATE jobs SET status = 'failed', result = $1, updated_at = NOW()
+                     WHERE id = $2",
+                )
+                .bind(e)
+                .bind(job_id)
+                .execute(&store)
+                .await
+            }
+        };
+
+        if let Err(e) = update_result {
+            eprintln!("Database error: {}", e);
         }
     }
 }
@@ -198,33 +270,70 @@ fn process_cpu_job(payload: &str) -> String {
     format!("hash: {hash:x}:{}", payload.to_uppercase())
 }
 
+// --- recower jobs ----
+
+async fn recover_jobs(store: &PgPool, tx: &mpsc::Sender<Uuid>) {
+    let recovered = sqlx::query_as::<_, Job>(
+        "WITH updated AS (
+            UPDATE jobs
+            SET status = 'pending', updated_at = NOW()
+            WHERE status IN ('pending', 'running')
+            RETURNING *
+        )
+        SELECT * FROM updated ORDER BY created_at ASC",
+    )
+    .fetch_all(store)
+    .await
+    .unwrap_or_default();
+
+    println!("Recovering {} jobs...", recovered.len());
+
+    for job in recovered.iter() {
+        match tx.try_send(job.id) {
+            Ok(_) => (),
+            Err(e) => eprintln!("Failed to send job: {e}"),
+        }
+    }
+}
+
+// --- INIT DB ---
+
+async fn init_db() -> PgPool {
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+
+    PgPoolOptions::new()
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to database")
+}
+
 #[tokio::main]
 async fn main() {
-    println!("Stage 3 — mpsc канал + пул воркеров");
-    println!("Store:    DashMap<Uuid, Job>");
-    println!("Workers:  {WORKER_COUNT} tokio tasks");
-    println!("Channel:  bounded({CHANNEL_CAPACITY})");
-    println!();
-    println!("Отличие от Stage 2:");
-    println!("  POST /jobs → 202 Accepted мгновенно (~мкс вместо 10ms)");
-    println!("  Обработка асинхронна: GET /jobs/:id опрашивает статус");
-    println!("  При переполнении очереди → 503 (backpressure)");
+    println!("Stage 5 — sqlx + PostgreSQL");
+    println!("Store:   PostgreSQL (единственное хранилище, без кэша)");
+    println!("Workers: {WORKER_COUNT} tokio tasks");
+    println!("Channel: bounded({CHANNEL_CAPACITY})");
     println!();
 
-    let store: Store = Arc::new(DashMap::new());
+    dotenv().ok();
+
+    let db = init_db().await;
 
     let tx = {
         let (tx, rx) = mpsc::channel::<Uuid>(CHANNEL_CAPACITY);
         let rx = Arc::new(Mutex::new(rx));
 
         for i in 0..WORKER_COUNT {
-            tokio::spawn(worker(i, Arc::clone(&rx), Arc::clone(&store)));
+            tokio::spawn(worker(i, Arc::clone(&rx), db.clone()));
         }
 
         tx
     };
 
-    let state = AppState { store, tx };
+    recover_jobs(&db, &tx).await;
+
+    let state = AppState { db, tx };
 
     let app = Router::new()
         .route("/health", get(health))
