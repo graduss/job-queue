@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 1s # как часто собирать метрики (5s для разработки, 15s для prod)
+  evaluation_interval: 5s # как часто вычислять recording rules
+
+scrape_configs:
+  # Сам Prometheus мониторит себя
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]
+
+  # Наш Rust сервис
+  # host.docker.internal — специальный DNS имя для доступа к host-машине из контейнера
+  # На Linux может не работать — тогда замени на реальный IP: 172.17.0.1
+  - job_name: job-queue
+    static_configs:
+      - targets: [host.docker.internal:3000]
+    metrics_path: /metrics
+    scrape_interval: 5s
+
+    # Если запустил несколько инстансов (для тестов масштабирования):
+    # - targets:
+    #     - host.docker.internal:3000
+    #     - host.docker.internal:3001

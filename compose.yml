@@ -13,9 +13,51 @@ services:
     networks:
       default:
         ipv4_address: 172.16.0.2
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobqueue"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle # позволяет reload конфига без рестарта
+    depends_on:
+      - postgres
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      # Автоматически подключаем Prometheus как datasource
+      GF_DATASOURCES_DEFAULT_URL: http://prometheus:9090
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # Provisioning: datasource и дашборд подгружаются при старте
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
 
 volumes:
   postgres_data:
+  prometheus_data:
+  grafana_data:
 
 networks:
   default:

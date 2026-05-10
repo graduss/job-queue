@@ -12,10 +12,10 @@
 
 BASE_URL="http://localhost:3000"
 DURATION=${DURATION:-10}
-CONNECTIONS=${CONNECTIONS:-50}
+CONNECTIONS=${CONNECTIONS:-100}
 
 if [[ "$1" == "--heavy" ]]; then
-    DURATION=30
+    DURATION=120
     CONNECTIONS=200
 fi
 
@@ -65,15 +65,15 @@ oha \
     "$BASE_URL/jobs"
 
 echo ""
-echo "--- GET /health (baseline latency) ---"
-oha \
-    -z 5s \
-    -c 100 \
-    "$BASE_URL/health"
+# echo "--- GET /health (baseline latency) ---"
+# oha \
+#     -z 5s \
+#     -c 100 \
+#     "$BASE_URL/health"
 
-echo ""
-echo "--- GET /jobs (read all) ---"
-oha \
-    -z "${DURATION}s" \
-    -c "$CONNECTIONS" \
-    "$BASE_URL/jobs"
+# echo ""
+# echo "--- GET /jobs (read all) ---"
+# oha \
+#     -z "${DURATION}s" \
+#     -c "$CONNECTIONS" \
+#     "$BASE_URL/jobs"

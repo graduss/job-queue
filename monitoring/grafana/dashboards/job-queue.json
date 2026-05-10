@@ -1,0 +1,338 @@
+{
+  "title": "Job Queue",
+  "uid": "job-queue-v1",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "timezone": "browser",
+  "tags": ["job-queue", "rust"],
+
+  "panels": [
+    {
+      "id": 1,
+      "title": "Throughput — Jobs Created (req/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(jobs_created_total{status=\"ok\"}[1m])) by (kind)",
+          "legendFormat": "created ({{kind}})",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(jobs_processed_total{status=\"done\"}[1m])) by (kind)",
+          "legendFormat": "done ({{kind}})",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(jobs_processed_total{status=\"failed\"}[1m])) by (kind)",
+          "legendFormat": "failed ({{kind}})",
+          "refId": "C"
+        }
+      ],
+      "options": { "tooltip": { "mode": "multi" } }
+    },
+
+    {
+      "id": 2,
+      "title": "Processing Latency (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 5 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(job_processing_duration_seconds_bucket[1m])) by (le, kind))",
+          "legendFormat": "p50 {{kind}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(job_processing_duration_seconds_bucket[1m])) by (le, kind))",
+          "legendFormat": "p95 {{kind}}",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(job_processing_duration_seconds_bucket[1m])) by (le, kind))",
+          "legendFormat": "p99 {{kind}}",
+          "refId": "C"
+        }
+      ]
+    },
+
+    {
+      "id": 3,
+      "title": "Queue Depth",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 8, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "fixedColor": "orange", "mode": "fixed" },
+          "custom": { "lineWidth": 2, "fillOpacity": 20 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "red", "value": 90 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "jobs_queue_depth",
+          "legendFormat": "queued jobs",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 4,
+      "title": "DB Connection Pool",
+      "type": "timeseries",
+      "gridPos": { "x": 8, "y": 8, "w": 8, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "db_pool_size",
+          "legendFormat": "total connections",
+          "refId": "A"
+        },
+        {
+          "expr": "db_pool_idle",
+          "legendFormat": "idle connections",
+          "refId": "B"
+        },
+        {
+          "expr": "db_pool_size - db_pool_idle",
+          "legendFormat": "active connections",
+          "refId": "C"
+        }
+      ]
+    },
+
+    {
+      "id": 5,
+      "title": "Queue Full Errors (503)",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 8, "w": 8, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": { "fixedColor": "red", "mode": "fixed" },
+          "custom": { "lineWidth": 2, "fillOpacity": 20 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(jobs_queue_full_total[1m])",
+          "legendFormat": "queue full / s",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 6,
+      "title": "Total Jobs Created",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 14, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "blue", "value": null }]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(jobs_created_total{status=\"ok\"})",
+          "legendFormat": "created",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 7,
+      "title": "Total Jobs Done",
+      "type": "stat",
+      "gridPos": { "x": 4, "y": 14, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(jobs_processed_total{status=\"done\"})",
+          "legendFormat": "done",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 8,
+      "title": "Total Jobs Failed",
+      "type": "stat",
+      "gridPos": { "x": 8, "y": 14, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(jobs_processed_total{status=\"failed\"})",
+          "legendFormat": "failed",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 9,
+      "title": "Current Queue Depth",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 14, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "red", "value": 90 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "jobs_queue_depth",
+          "legendFormat": "queued",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 10,
+      "title": "Error Rate",
+      "type": "stat",
+      "gridPos": { "x": 16, "y": 14, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.01 },
+              { "color": "red", "value": 0.05 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(jobs_processed_total{status=\"failed\"}[5m])) / sum(rate(jobs_processed_total[5m]))",
+          "legendFormat": "error rate",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 11,
+      "title": "p99 Latency (last 5m)",
+      "type": "stat",
+      "gridPos": { "x": 20, "y": 14, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.1 },
+              { "color": "red", "value": 0.5 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(job_processing_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

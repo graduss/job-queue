@@ -1,69 +1,35 @@
 use axum::{
-    Json, Router,
-    extract::{Path, State},
+    Router,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::{DateTime, Utc};
 use dotenvy::dotenv;
-use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
-const WORKER_COUNT: usize = 10;
-const CHANNEL_CAPACITY: usize = 1_000;
+use metrics::{counter, gauge};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
+use tower_http::trace::TraceLayer;
+use tracing::{error, info, instrument, warn};
 
-const CPU_WORK_ITERATIONS: usize = 5_000;
+mod models;
+use models::*;
 
-// Models
+mod worker;
+use worker::*;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, sqlx::Type, PartialEq)]
-#[serde(rename_all = "snake_case")]
-#[sqlx(type_name = "job_kind", rename_all = "snake_case")]
-pub enum JobKind {
-    #[default]
-    Io,
-    Cpu,
-}
+mod handlers;
+use handlers::*;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, sqlx::Type)]
-#[serde(rename_all = "snake_case")]
-#[sqlx(rename_all = "snake_case", type_name = "job_status")]
-pub enum JobStatus {
-    #[default]
-    Pending,
-    Running,
-    Done,
-    Failed,
-}
+pub const WORKER_COUNT: usize = 8;
+pub const CHANNEL_CAPACITY: usize = 50_000;
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-pub struct Job {
-    pub id: Uuid,
-    pub payload: String,
-    pub kind: JobKind,
-    pub status: JobStatus,
-    pub result: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CreateJobRequest {
-    pub payload: String,
-    #[serde(default)]
-    pub kind: JobKind,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CreateJobResponse {
-    pub id: Uuid,
-    pub status: JobStatus,
-    pub kind: JobKind,
-}
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 // AppState
 pub type SharedRx = Arc<Mutex<mpsc::Receiver<Uuid>>>;
@@ -87,191 +53,13 @@ impl IntoResponse for AppError {
 #[derive(Clone)]
 pub struct AppState {
     db: PgPool,
-    tx: mpsc::Sender<Uuid>,
-}
-
-// Handlers
-
-async fn create_job(
-    State(state): State<AppState>,
-    Json(req): Json<CreateJobRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    let mut tx = state.db.begin().await.map_err(|e| {
-        eprintln!("{:?}", e);
-        AppError::InternalServerError
-    })?;
-
-    let job = sqlx::query_as::<_, Job>(
-        "INSERT INTO jobs (payload, kind)
-         VALUES ($1, $2)
-         RETURNING *",
-    )
-    .bind(&req.payload)
-    .bind(&req.kind)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| {
-        eprintln!("{:?}", e);
-        AppError::InternalServerError
-    })?;
-
-    match state.tx.try_send(job.id) {
-        Ok(_) => {
-            tx.commit().await.map_err(|e| {
-                eprintln!("{:?}", e);
-                AppError::InternalServerError
-            })?;
-            Ok((
-                StatusCode::ACCEPTED,
-                Json(CreateJobResponse {
-                    id: job.id,
-                    status: job.status,
-                    kind: job.kind,
-                }),
-            ))
-        }
-        Err(_) => {
-            tx.rollback().await.map_err(|e| {
-                eprintln!("{:?}", e);
-                AppError::InternalServerError
-            })?;
-            return Err(AppError::ServiceUnavailable);
-        }
-    }
-}
-
-async fn get_job(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<impl IntoResponse, AppError> {
-    let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
-        .bind(&id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|_| AppError::InternalServerError)?
-        .ok_or(AppError::JobNotFound)?;
-
-    Ok((StatusCode::OK, Json(job)))
-}
-
-async fn list_jobs(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
-    let jobs = sqlx::query_as::<_, Job>("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 5000")
-        .fetch_all(&state.db)
-        .await
-        .map_err(|_| AppError::InternalServerError)?;
-
-    Ok((StatusCode::OK, Json(jobs)))
-}
-
-async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let queued = state.tx.max_capacity() - state.tx.capacity();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "stage": 0,
-            "workers": WORKER_COUNT,
-            "queue_capacity": CHANNEL_CAPACITY,
-            "CPU_WORK_ITERATIONS": CPU_WORK_ITERATIONS,
-            "queue_used": queued,
-        })),
-    )
-}
-
-// Wrker
-
-async fn worker(id: usize, rx: SharedRx, store: PgPool) {
-    println!("Worker {id} started");
-
-    loop {
-        let job_id = {
-            let mut rx_guard = rx.lock().await;
-            match rx_guard.recv().await {
-                Some(id) => id,
-                None => {
-                    println!("Worker {id}: channel closed, exiting");
-                    break;
-                }
-            }
-        };
-
-        let row = sqlx::query_as::<_, Job>(
-            "UPDATE jobs SET status = 'running', updated_at = NOW()
-             WHERE id = $1 AND status = 'pending'
-             RETURNING *",
-        )
-        .bind(&job_id)
-        .fetch_optional(&store)
-        .await;
-
-        let job = match row {
-            Ok(Some(job)) => job,
-            Ok(None) => {
-                println!("Worker {id}: job not found or already processed");
-                continue;
-            }
-            Err(e) => {
-                println!("Worker {id}: database error: {e}");
-                continue;
-            }
-        };
-
-        let result = match job.kind {
-            JobKind::Io => Ok(pocess_io_job(&job.payload).await),
-            JobKind::Cpu => tokio::task::spawn_blocking(move || process_cpu_job(&job.payload))
-                .await
-                .map_err(|e| e.to_string()),
-        };
-
-        let update_result = match result {
-            Ok(response) => {
-                sqlx::query(
-                    "UPDATE jobs SET status = 'done', result = $1, updated_at = NOW()
-                     WHERE id = $2",
-                )
-                .bind(response)
-                .bind(job_id)
-                .execute(&store)
-                .await
-            }
-            Err(e) => {
-                sqlx::query(
-                    "UPDATE jobs SET status = 'failed', result = $1, updated_at = NOW()
-                     WHERE id = $2",
-                )
-                .bind(e)
-                .bind(job_id)
-                .execute(&store)
-                .await
-            }
-        };
-
-        if let Err(e) = update_result {
-            eprintln!("Database error: {}", e);
-        }
-    }
-}
-
-// Simulator
-
-async fn pocess_io_job(payload: &str) -> String {
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    format!("processed: {}", payload.to_uppercase())
-}
-
-fn process_cpu_job(payload: &str) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for _ in 0..CPU_WORK_ITERATIONS {
-        for &byte in payload.as_bytes() {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
-    format!("hash: {hash:x}:{}", payload.to_uppercase())
+    tx: Arc<mpsc::Sender<Uuid>>,
+    prom: PrometheusHandle,
 }
 
 // --- recower jobs ----
 
+#[instrument(skip(store, tx))]
 async fn recover_jobs(store: &PgPool, tx: &mpsc::Sender<Uuid>) {
     let recovered = sqlx::query_as::<_, Job>(
         "WITH updated AS (
@@ -280,23 +68,65 @@ async fn recover_jobs(store: &PgPool, tx: &mpsc::Sender<Uuid>) {
             WHERE status IN ('pending', 'running')
             RETURNING *
         )
-        SELECT * FROM updated ORDER BY created_at ASC",
+        SELECT * FROM updated ORDER BY created_at ASC LIMIT $1",
     )
+    .bind(50_000)
     .fetch_all(store)
     .await
     .unwrap_or_default();
 
-    println!("Recovering {} jobs...", recovered.len());
+    warn!(count = recovered.len(), "recovering unfinished jobs");
 
     for job in recovered.iter() {
         match tx.try_send(job.id) {
             Ok(_) => (),
-            Err(e) => eprintln!("Failed to send job: {e}"),
+            Err(e) => warn!("Failed to send job: {e}"),
         }
     }
 }
 
-// --- INIT DB ---
+// --- INITs ---
+
+fn init_tracing() {
+    // RUST_LOG управляет фильтрацией.
+    // Дефолт: наш код на info, sqlx на warn (иначе логирует каждый SQL)
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|e| {
+        eprint!("{e}");
+        "job_queue=info,tower_http=info,sqlx=warn".parse().unwrap()
+    });
+
+    tracing_subscriber::fmt()
+        // Для разработки: pretty() — человекочитаемо с цветами и отступами.
+        // Для production: .json() — структурированный JSON для Loki/Datadog.
+        // .pretty()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_thread_ids(true)
+        .init();
+}
+
+fn init_metrics() -> PrometheusHandle {
+    // PrometheusBuilder::new().build() возвращает (recorder, handle).
+    // recorder устанавливается как глобальный — все вызовы counter!/gauge!/histogram!
+    // пишут в него. handle.render() собирает итоговый текст для /metrics.
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::set_global_recorder(recorder).unwrap();
+
+    // Инициализируем метрики нулём — чтобы они сразу появились в /metrics
+    // даже если событий ещё не было. Удобно для алертов: "метрика исчезла" = проблема.
+    counter!("jobs_created_total", "status" => "ok", "kind" => "io").absolute(0);
+    counter!("jobs_created_total", "status" => "ok", "kind" => "cpu").absolute(0);
+    counter!("jobs_processed_total", "status" => "done", "kind" => "io").absolute(0);
+    counter!("jobs_processed_total", "status" => "done", "kind" => "cpu").absolute(0);
+    counter!("jobs_processed_total", "status" => "failed", "kind" => "io").absolute(0);
+    counter!("jobs_queue_full_total").absolute(0);
+    gauge!("jobs_queue_depth").set(0.0);
+    gauge!("db_pool_size").set(0.0);
+    gauge!("db_pool_idle").set(0.0);
+
+    handle
+}
 
 async fn init_db() -> PgPool {
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -310,22 +140,42 @@ async fn init_db() -> PgPool {
 
 #[tokio::main]
 async fn main() {
-    println!("Stage 5 — sqlx + PostgreSQL");
-    println!("Store:   PostgreSQL (единственное хранилище, без кэша)");
-    println!("Workers: {WORKER_COUNT} tokio tasks");
-    println!("Channel: bounded({CHANNEL_CAPACITY})");
-    println!();
-
     dotenv().ok();
+    init_tracing();
+    let prom = init_metrics();
+
+    info!("starting job-queue stage 6");
+    info!(
+        workers = WORKER_COUNT,
+        channel_capacity = CHANNEL_CAPACITY,
+        "configuration"
+    );
 
     let db = init_db().await;
+    info!(
+        pool_size = db.size(),
+        pool_idle = db.num_idle(),
+        "database connected"
+    );
 
+    // Один токен — все компоненты держат его клон.
+    // token.cancel() разбудит всех одновременно.
+    let token = CancellationToken::new();
+    let mut worker_set = JoinSet::new();
     let tx = {
         let (tx, rx) = mpsc::channel::<Uuid>(CHANNEL_CAPACITY);
         let rx = Arc::new(Mutex::new(rx));
+        let tx = Arc::new(tx);
 
+        // Запускаем воркеры через JoinSet — он позволяет ждать завершения всех
         for i in 0..WORKER_COUNT {
-            tokio::spawn(worker(i, Arc::clone(&rx), db.clone()));
+            worker_set.spawn(worker(
+                i,
+                Arc::clone(&rx),
+                Arc::clone(&tx),
+                db.clone(),
+                token.clone(),
+            ));
         }
 
         tx
@@ -333,24 +183,58 @@ async fn main() {
 
     recover_jobs(&db, &tx).await;
 
-    let state = AppState { db, tx };
+    let state = AppState {
+        db: db.clone(),
+        tx,
+        prom,
+    };
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_handler)) // ← Prometheus scrape
         .route("/jobs", get(list_jobs))
         .route("/jobs", post(create_job))
         .route("/jobs/{id}", get(get_job))
+        .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let addr = "0.0.0.0:3000";
-    println!("Listening on http://{}", addr);
-    println!();
-    println!("Endpoints:");
-    println!("  POST   /jobs       {{\"payload\": \"hello\"}}");
-    println!("  GET    /jobs/:id");
-    println!("  GET    /jobs");
-    println!("  GET    /health");
 
+    info!(addr, "listening");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(token.clone()));
+
+    if let Err(e) = server.await {
+        error!(error = %e, "Server error");
+    }
+
+    info!("http server stopped, waiting for workers...");
+
+    // Ждём завершения воркеров с таймаутом.
+    // tokio::time::timeout обернёт future и вернёт Err если истечёт время.
+    let shutdown_result = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+        // join_next() ждёт завершения ОДНОГО воркера за раз.
+        // Цикл продолжается пока все не завершатся.
+        while let Some(result) = worker_set.join_next().await {
+            match result {
+                Ok(_) => info!("worker finished"),
+                Err(e) => error!(error = %e, "worker panicked"),
+            }
+        }
+    })
+    .await;
+
+    match shutdown_result {
+        Ok(_) => info!("all workers stopped cleanly"),
+        Err(_) => warn!(
+            timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
+            "shutdown timeout — some workers did not finish in time"
+        ),
+    }
+
+    // Закрываем пул БД последним — воркеры могли делать запросы до конца
+    info!("closing database pool...");
+    db.close().await;
+
+    info!("shutdown complete ✓");
 }
