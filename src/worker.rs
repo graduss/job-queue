@@ -7,47 +7,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
-const CPU_WORK_ITERATIONS: usize = 5000;
+const CPU_WORK_ITERATIONS: usize = 5_000_000;
 
 use crate::{Job, JobKind, SharedRx};
 
-// ─── Обработчик сигналов ──────────────────────────────────────
-
-// Ждём SIGTERM (от Docker/Kubernetes) или SIGINT (Ctrl+C).
-// Как только получен — отменяем токен → все компоненты начинают shutdown.
-pub async fn shutdown_signal(token: CancellationToken) {
-    // ctrl_c ловит SIGINT (Ctrl+C) на всех платформах
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to listen for Ctrl+C");
-    };
-
-    // SIGTERM — стандартный сигнал от Docker stop, Kubernetes, systemd
-    // Доступен только на Unix
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to listen for SIGTERM")
-            .recv()
-            .await;
-    };
-
-    // На Windows SIGTERM не поддерживается — ждём только Ctrl+C
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    // Ждём первого из двух сигналов
-    tokio::select! {
-        _ = ctrl_c    => info!("received SIGINT (Ctrl+C)"),
-        _ = terminate => info!("received SIGTERM"),
-    }
-
-    info!("initiating graceful shutdown...");
-    token.cancel();
-}
-
-#[instrument(skip(rx, store))]
+#[instrument(skip(rx, store, tx, token))]
 pub async fn worker(
     id: usize,
     rx: SharedRx,
@@ -60,6 +24,10 @@ pub async fn worker(
     loop {
         let job_id = tokio::select! {
             biased;
+            _ = token.cancelled() => {
+                info!(worker_id = id, "channel closed, exiting");
+                break;
+            },
 
             maybe_id = async {
                 let mut rx_guard = rx.lock().await;
@@ -72,11 +40,6 @@ pub async fn worker(
                         break;
                     }
                 }
-            },
-
-            _ = token.cancelled() => {
-                info!("channel closed, exiting");
-                break;
             }
         };
 

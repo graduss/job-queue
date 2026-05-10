@@ -21,15 +21,15 @@ mod models;
 use models::*;
 
 mod worker;
-use worker::*;
+use worker::worker;
 
 mod handlers;
 use handlers::*;
 
-pub const WORKER_COUNT: usize = 8;
+pub const WORKER_COUNT: usize = 4;
 pub const CHANNEL_CAPACITY: usize = 50_000;
 
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 // AppState
 pub type SharedRx = Arc<Mutex<mpsc::Receiver<Uuid>>>;
@@ -70,7 +70,7 @@ async fn recover_jobs(store: &PgPool, tx: &mpsc::Sender<Uuid>) {
         )
         SELECT * FROM updated ORDER BY created_at ASC LIMIT $1",
     )
-    .bind(50_000)
+    .bind(500)
     .fetch_all(store)
     .await
     .unwrap_or_default();
@@ -132,10 +132,46 @@ async fn init_db() -> PgPool {
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     PgPoolOptions::new()
-        .acquire_timeout(Duration::from_secs(5))
+        .acquire_timeout(Duration::from_secs(15))
         .connect(&database_url)
         .await
         .expect("Failed to connect to database")
+}
+
+// ─── Обработчик сигналов ──────────────────────────────────────
+
+// Ждём SIGTERM (от Docker/Kubernetes) или SIGINT (Ctrl+C).
+// Как только получен — отменяем токен → все компоненты начинают shutdown.
+pub async fn shutdown_signal(token: CancellationToken) {
+    // ctrl_c ловит SIGINT (Ctrl+C) на всех платформах
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for Ctrl+C");
+    };
+
+    // SIGTERM — стандартный сигнал от Docker stop, Kubernetes, systemd
+    // Доступен только на Unix
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to listen for SIGTERM")
+            .recv()
+            .await;
+    };
+
+    // На Windows SIGTERM не поддерживается — ждём только Ctrl+C
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    // Ждём первого из двух сигналов
+    tokio::select! {
+        _ = ctrl_c    => info!("received SIGINT (Ctrl+C)"),
+        _ = terminate => info!("received SIGTERM"),
+    }
+
+    info!("initiating graceful shutdown...");
+    token.cancel();
 }
 
 #[tokio::main]
@@ -144,7 +180,7 @@ async fn main() {
     init_tracing();
     let prom = init_metrics();
 
-    info!("starting job-queue stage 6");
+    info!("starting job-queue stage 7");
     info!(
         workers = WORKER_COUNT,
         channel_capacity = CHANNEL_CAPACITY,
@@ -158,30 +194,27 @@ async fn main() {
         "database connected"
     );
 
+    let (tx, rx) = mpsc::channel::<Uuid>(CHANNEL_CAPACITY);
+    let tx = Arc::new(tx);
+    let rx = Arc::new(Mutex::new(rx));
+
+    recover_jobs(&db, &tx).await;
+
     // Один токен — все компоненты держат его клон.
     // token.cancel() разбудит всех одновременно.
     let token = CancellationToken::new();
     let mut worker_set = JoinSet::new();
-    let tx = {
-        let (tx, rx) = mpsc::channel::<Uuid>(CHANNEL_CAPACITY);
-        let rx = Arc::new(Mutex::new(rx));
-        let tx = Arc::new(tx);
 
-        // Запускаем воркеры через JoinSet — он позволяет ждать завершения всех
-        for i in 0..WORKER_COUNT {
-            worker_set.spawn(worker(
-                i,
-                Arc::clone(&rx),
-                Arc::clone(&tx),
-                db.clone(),
-                token.clone(),
-            ));
-        }
-
-        tx
-    };
-
-    recover_jobs(&db, &tx).await;
+    // Запускаем воркеры через JoinSet — он позволяет ждать завершения всех
+    for i in 0..WORKER_COUNT {
+        worker_set.spawn(worker(
+            i,
+            Arc::clone(&rx),
+            Arc::clone(&tx),
+            db.clone(),
+            token.clone(),
+        ));
+    }
 
     let state = AppState {
         db: db.clone(),
@@ -226,8 +259,8 @@ async fn main() {
 
     match shutdown_result {
         Ok(_) => info!("all workers stopped cleanly"),
-        Err(_) => warn!(
-            timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
+        Err(e) => warn!(
+            timeout_secs = e.to_string(),
             "shutdown timeout — some workers did not finish in time"
         ),
     }
