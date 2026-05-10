@@ -8,8 +8,11 @@ use metrics::{counter, gauge};
 use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
+use lapin::{BasicProperties, options::BasicPublishOptions};
+
 use crate::{
-    AppError, AppState, CHANNEL_CAPACITY, CreateJobRequest, CreateJobResponse, Job, WORKER_COUNT,
+    AppError, AppState, CreateJobRequest, CreateJobResponse, Job, JobMessage, QUEUE_NAME,
+    WORKER_COUNT,
 };
 
 // --- Handlers ---
@@ -37,10 +40,19 @@ pub async fn create_job(
         AppError::InternalServerError
     })?;
 
-    let queued = (state.tx.max_capacity() - state.tx.capacity()) as f64;
-    gauge!("jobs_queue_depth").set(queued);
+    let msg = serde_json::to_vec(&JobMessage { job_id: job.id }).unwrap();
+    let publish_result = state
+        .amqp
+        .basic_publish(
+            "".into(),
+            QUEUE_NAME.into(),
+            BasicPublishOptions::default(),
+            &msg,
+            BasicProperties::default(),
+        )
+        .await;
 
-    match state.tx.try_send(job.id) {
+    match publish_result {
         Ok(_) => Ok((
             StatusCode::ACCEPTED,
             Json(CreateJobResponse {
@@ -97,10 +109,8 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let db_ok = sqlx::query("SELECT 1").execute(&state.db).await.is_ok();
     let pool_size = state.db.size();
     let pool_idle = state.db.num_idle();
-    let queued = state.tx.max_capacity() - state.tx.capacity();
 
     // Обновляем gauge при каждом health-check
-    gauge!("jobs_queue_depth").set(queued as f64);
     gauge!("db_pool_size").set(pool_size as f64);
     gauge!("db_pool_idle").set(pool_idle as f64);
 
@@ -108,13 +118,11 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
         StatusCode::OK,
         Json(serde_json::json!({
             "status": if db_ok { "ok" } else { "degraded" },
-            "stage": 6,
+            "stage": 7,
             "db": if db_ok { "ok" } else { "error" },
             "pool_size": pool_size,
             "pool_idle": pool_idle,
             "workers": WORKER_COUNT,
-            "queue_capacity": CHANNEL_CAPACITY,
-            "queue_used": queued,
         })),
     )
 }

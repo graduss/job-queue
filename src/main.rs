@@ -10,6 +10,12 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
+use lapin::{
+    BasicProperties, Channel, Connection, ConnectionProperties,
+    options::{BasicPublishOptions, QueueDeclareOptions},
+    types::FieldTable,
+};
+
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use tokio::task::JoinSet;
@@ -27,9 +33,13 @@ mod handlers;
 use handlers::*;
 
 pub const WORKER_COUNT: usize = 4;
-pub const CHANNEL_CAPACITY: usize = 50_000;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+// Имя очереди в RabbitMQ.
+// В production используй отдельные очереди для разных типов задач:
+// "jobs.io", "jobs.cpu", "jobs.priority_high" и т.д.
+const QUEUE_NAME: &str = "jobs";
 
 // AppState
 pub type SharedRx = Arc<Mutex<mpsc::Receiver<Uuid>>>;
@@ -53,14 +63,14 @@ impl IntoResponse for AppError {
 #[derive(Clone)]
 pub struct AppState {
     db: PgPool,
-    tx: Arc<mpsc::Sender<Uuid>>,
+    amqp: Arc<Channel>,
     prom: PrometheusHandle,
 }
 
 // --- recower jobs ----
 
-#[instrument(skip(store, tx))]
-async fn recover_jobs(store: &PgPool, tx: &mpsc::Sender<Uuid>) {
+#[instrument(skip(store, amqp))]
+async fn recover_jobs(store: &PgPool, amqp: &Channel) {
     let recovered = sqlx::query_as::<_, Job>(
         "WITH updated AS (
             UPDATE jobs
@@ -78,9 +88,23 @@ async fn recover_jobs(store: &PgPool, tx: &mpsc::Sender<Uuid>) {
     warn!(count = recovered.len(), "recovering unfinished jobs");
 
     for job in recovered.iter() {
-        match tx.try_send(job.id) {
-            Ok(_) => (),
-            Err(e) => warn!("Failed to send job: {e}"),
+        let result = if let Ok(msg) = serde_json::to_vec(&JobMessage { job_id: job.id }) {
+            amqp.basic_publish(
+                "".into(),
+                QUEUE_NAME.into(),
+                BasicPublishOptions::default(),
+                &msg,
+                BasicProperties::default(),
+            )
+            .await
+        } else {
+            warn!("Failed to serialize job: {}", job.id);
+            continue;
+        };
+
+        match result {
+            Ok(_) => info!(job_id = %job.id, "re-published"),
+            Err(e) => error!(job_id = %job.id, "failed to re-publish: {e}"),
         }
     }
 }
@@ -138,6 +162,37 @@ async fn init_db() -> PgPool {
         .expect("Failed to connect to database")
 }
 
+async fn init_amqp() -> Arc<Connection> {
+    let url = std::env::var("RABBITMQ_URL")
+        .unwrap_or_else(|_| "amqp://jobqueue:jobqueue@localhost:5672/jobqueue".to_string());
+
+    let conn = Connection::connect(&url, ConnectionProperties::default())
+        .await
+        .expect("Failed to connect to RabbitMQ");
+
+    info!("rabbitmq connected: {:?}", conn.status());
+    Arc::new(conn)
+}
+
+// Создаёт очередь если она ещё не существует.
+// durable=true — очередь переживает рестарт брокера.
+// Без durable: рестарт RabbitMQ = пустая очередь.
+async fn declare_queue(channel: &Channel) {
+    channel
+        .queue_declare(
+            QUEUE_NAME.into(),
+            QueueDeclareOptions {
+                durable: true, // очередь сохраняется на диск
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .expect("Failed to declare queue");
+
+    info!(queue = QUEUE_NAME, "queue declared (durable=true)");
+}
+
 // ─── Обработчик сигналов ──────────────────────────────────────
 
 // Ждём SIGTERM (от Docker/Kubernetes) или SIGINT (Ctrl+C).
@@ -181,11 +236,7 @@ async fn main() {
     let prom = init_metrics();
 
     info!("starting job-queue stage 7");
-    info!(
-        workers = WORKER_COUNT,
-        channel_capacity = CHANNEL_CAPACITY,
-        "configuration"
-    );
+    info!(workers = WORKER_COUNT, "configuration");
 
     let db = init_db().await;
     info!(
@@ -194,11 +245,21 @@ async fn main() {
         "database connected"
     );
 
-    let (tx, rx) = mpsc::channel::<Uuid>(CHANNEL_CAPACITY);
-    let tx = Arc::new(tx);
-    let rx = Arc::new(Mutex::new(rx));
+    // Одно Connection — разделяется между воркерами.
+    // Каждый воркер создаст свой Channel внутри этого Connection.
+    let amqp_conn = init_amqp().await;
 
-    recover_jobs(&db, &tx).await;
+    // Channel для публикации (хэндлеры) — отдельный от воркерских
+    let publish_channel = amqp_conn
+        .create_channel()
+        .await
+        .expect("Failed to create publish channel");
+
+    // Объявляем очередь — идемпотентная операция,
+    // безопасно вызывать при каждом старте
+    declare_queue(&publish_channel).await;
+
+    recover_jobs(&db, &publish_channel).await;
 
     // Один токен — все компоненты держат его клон.
     // token.cancel() разбудит всех одновременно.
@@ -207,18 +268,12 @@ async fn main() {
 
     // Запускаем воркеры через JoinSet — он позволяет ждать завершения всех
     for i in 0..WORKER_COUNT {
-        worker_set.spawn(worker(
-            i,
-            Arc::clone(&rx),
-            Arc::clone(&tx),
-            db.clone(),
-            token.clone(),
-        ));
+        worker_set.spawn(worker(i, db.clone(), Arc::clone(&amqp_conn), token.clone()));
     }
 
     let state = AppState {
         db: db.clone(),
-        tx,
+        amqp: Arc::new(publish_channel),
         prom,
     };
 

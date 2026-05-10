@@ -67,3 +67,12 @@ pub struct CreateJobResponse {
     pub status: JobStatus,
     pub kind: JobKind,
 }
+
+// Сообщение которое кладём в RabbitMQ.
+// Содержит только id — данные берём из PostgreSQL.
+// Альтернатива: класть весь payload в сообщение (избегаем SELECT в воркере,
+// но сообщение растёт и теряем единый источник правды).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JobMessage {
+    pub job_id: Uuid,
+}

@@ -13,7 +13,10 @@ path = "src/main.rs"
 axum = "0.8.9"
 chrono = { version = "0.4.44", features = ["serde"] }
 dashmap = "6.1.0"
+deadpool-lapin = "0.13.1"
 dotenvy = "0.15.7"
+futures-lite = "2.6.1"
+lapin = "4.7.2"
 metrics = "0.24.5"
 metrics-exporter-prometheus = "0.18.3"
 serde = { version = "1.0.228", features = ["derive"] }

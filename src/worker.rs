@@ -1,47 +1,119 @@
-use metrics::{counter, gauge, histogram};
+use lapin::{
+    Connection,
+    options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions},
+    types::FieldTable,
+};
+use metrics::{counter, histogram};
 use sqlx::PgPool;
 use std::time::Instant;
 use std::{sync::Arc, time::Duration};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, instrument, warn};
-use uuid::Uuid;
 
-const CPU_WORK_ITERATIONS: usize = 5_000_000;
+const CPU_WORK_ITERATIONS: usize = 50_000;
 
-use crate::{Job, JobKind, SharedRx};
+// Сколько сообщений воркер держит in-flight.
+// 1 = fair dispatch: следующее сообщение только после ack предыдущего.
+const PREFETCH_COUNT: u16 = 1;
 
-#[instrument(skip(rx, store, tx, token))]
-pub async fn worker(
-    id: usize,
-    rx: SharedRx,
-    tx: Arc<mpsc::Sender<Uuid>>,
-    store: PgPool,
-    token: CancellationToken,
-) {
+use crate::{Job, JobKind, JobMessage, QUEUE_NAME};
+
+#[instrument(skip(store, amqp, token))]
+pub async fn worker(id: usize, store: PgPool, amqp: Arc<Connection>, token: CancellationToken) {
+    let span = tracing::info_span!("worker", id);
+    let _enter = span.enter();
     info!("started");
 
+    // Каждый воркер создаёт свой Channel внутри общего Connection.
+    // Channel — lightweight, не надо переиспользовать между потоками.
+    let channel = match amqp.create_channel().await {
+        Ok(ch) => ch,
+        Err(e) => {
+            error!(error = %e, "failed to create amqp channel");
+            return;
+        }
+    };
+
+    // QoS: prefetch_count=1 — fair dispatch.
+    // Следующее сообщение воркер получит только после ack предыдущего.
+    // Без этого RabbitMQ мог бы отдать все сообщения одному быстрому воркеру.
+    if let Err(e) = channel
+        .basic_qos(PREFETCH_COUNT, BasicQosOptions::default())
+        .await
+    {
+        error!(error = %e, "failed to set qos");
+        return;
+    }
+
+    // Подписываемся на очередь — получаем Consumer (AsyncIterator)
+    let mut consumer = match channel
+        .basic_consume(
+            QUEUE_NAME.into(),
+            format!("worker-{id}").into(), // уникальный тег консьюмера
+            BasicConsumeOptions {
+                no_ack: false, // false = manual ack (мы сами подтверждаем)
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "failed to start consuming");
+            return;
+        }
+    };
+
+    info!("consuming from queue '{QUEUE_NAME}'");
+
     loop {
-        let job_id = tokio::select! {
+        let delivery = tokio::select! {
             biased;
+
             _ = token.cancelled() => {
                 info!(worker_id = id, "channel closed, exiting");
                 break;
             },
 
-            maybe_id = async {
-                let mut rx_guard = rx.lock().await;
-                rx_guard.recv().await
-            } => {
-                match maybe_id {
-                    Some(id) => id,
-                    _ => {
-                        info!("channel closed, exiting");
-                        break;
-                    }
-                }
+            msg = futures_lite::StreamExt::next(&mut consumer) => msg
+        };
+
+        let delivery = match delivery {
+            Some(Ok(d)) => d,
+            Some(Err(e)) => {
+                error!(error = %e, "consumer error");
+                // При ошибке — небольшая пауза и продолжаем
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            None => {
+                // Consumer закрыт (соединение разорвано)
+                warn!("consumer stream ended");
+                break;
             }
         };
+
+        // Десериализуем сообщение
+        let msg: JobMessage = match serde_json::from_slice(&delivery.data) {
+            Ok(m) => m,
+            Err(e) => {
+                error!(error = %e, "failed to deserialize message — nack without requeue");
+                // Отравленное сообщение — отклоняем без повторной постановки в очередь.
+                // В production: настрой Dead Letter Exchange чтобы такие сообщения
+                // попадали в отдельную очередь для анализа.
+                let _ = delivery
+                    .nack(BasicNackOptions {
+                        requeue: false,
+                        ..Default::default()
+                    })
+                    .await;
+                counter!("jobs_processed_total", "status" => "poison").increment(1);
+                continue;
+            }
+        };
+
+        let job_id = msg.job_id;
 
         let row = sqlx::query_as::<_, Job>(
             "UPDATE jobs SET status = 'running', updated_at = NOW()
@@ -56,11 +128,20 @@ pub async fn worker(
             Ok(Some(job)) => job,
             Ok(None) => {
                 warn!(job_id = %job_id, "job not found or already claimed");
+                // Ack — сообщение обработано (пусть и вхолостую)
+                let _ = delivery.ack(BasicAckOptions::default()).await;
                 counter!("jobs_processed_total", "status" => "skipped").increment(1);
                 continue;
             }
             Err(e) => {
                 error!(job_id = %job_id, error = %e, "db error on claim");
+                // БД недоступна — возвращаем сообщение в очередь
+                let _ = delivery
+                    .nack(BasicNackOptions {
+                        requeue: true,
+                        ..Default::default()
+                    })
+                    .await;
                 counter!("jobs_processed_total", "status" => "db_error").increment(1);
                 continue;
             }
@@ -118,13 +199,21 @@ pub async fn worker(
             }
         };
 
-        if let Err(e) = update_result {
-            error!(job_id = %job_id, error = %e, "db error on update");
+        match update_result {
+            Ok(_) => {
+                let _ = delivery.ack(BasicAckOptions::default()).await;
+            }
+            Err(e) => {
+                error!(job_id = %job_id, error = %e, "db error on update");
+                // Ack — сообщение обработано (пусть и вхолостую)
+                let _ = delivery
+                    .nack(BasicNackOptions {
+                        requeue: true,
+                        ..Default::default()
+                    })
+                    .await;
+            }
         }
-
-        let queued = tx.max_capacity() - tx.capacity();
-        // Обновляем gauge при каждом health-check
-        gauge!("jobs_queue_depth").set(queued as f64);
     }
 
     info!("worker stopped cleanly");
